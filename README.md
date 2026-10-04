@@ -106,4 +106,28 @@ python -m pytest tests/test_2pc.py -v
 4. 每个键在所有参与者上的最终值一致，且等于某个已提交事务写入的值。
 
 ## Conditional writes
-A submit operation may include `expected`: a string means the local key must equal it, null means the key must not exist, and omitting it is an unconditional put. Every participant must satisfy every condition in its own durable state for the transaction to commit. Preparation owns the checked keys until the durable decision. Retries with the same transaction ID refer to the same complete conditional request, across restarts; altered values or conditions are rejected. Failed conditions vote No durably and release the transaction through the existing abort path.
+A submit operation may include `expected`. Each participant evaluates every
+condition against its own durable state during `prepare`, inside the same
+SQLite write transaction that durably records the yes vote and key locks.
+Therefore the observed values remain protected from the condition check until
+the transaction receives its durable commit/abort decision.
+
+* `expected` omitted: unconditional put.
+* `expected: "x"`: the key must exist locally and its value must be `"x"`.
+* `expected: null`: the key must not exist locally.
+* `value: null` writes a real SQL NULL. A row containing NULL is distinct from
+  a missing key. Participant `get` returns both `value` and an explicit
+  `exists` flag (for example, `{"exists": true, "value": null}` versus
+  `{"exists": false, "value": null}`).
+
+A no vote from any participant makes the whole group abort; unconditional puts
+in the same transaction are also not applied. No votes are persisted, and the
+normal abort path releases all locks.
+
+The complete canonical request (all keys, values, and conditions) is stored
+with the transaction ID on the coordinator and every participant. Retries with
+the same ID must use exactly that request; a changed value, condition, key set,
+or missing/extra operation is rejected with `REQUEST_MISMATCH` rather than
+returning the original transaction's state. Coordinator and participant status
+responses include the durable canonical `request_id` so a response can prove
+which complete agreement it represents.

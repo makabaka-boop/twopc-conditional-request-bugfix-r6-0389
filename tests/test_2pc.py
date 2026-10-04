@@ -17,6 +17,7 @@
 import json
 import os
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -723,6 +724,247 @@ class TwoPCTests(unittest.TestCase):
             else:
                 # 该键的所有写事务都中止了：键必须不存在
                 self.assertIsNone(final_values[key], key)
+
+
+class ConditionalWriteTests(unittest.TestCase):
+    """真实子进程下的条件写语义。每个用例使用独立集群和独立数据文件。"""
+
+    def setUp(self):
+        self.cluster = Cluster(n_participants=3)
+        self.cluster.start_all()
+
+    def tearDown(self):
+        self.cluster.stop_all()
+
+    @staticmethod
+    def seed_kv(node, key, value):
+        conn = sqlite3.connect(node.db)
+        try:
+            conn.execute(
+                "INSERT INTO kv(key, value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def op(self, key, value, expected=...):
+        item = {"key": key, "value": value}
+        if expected is not ...:
+            item["expected"] = expected
+        return item
+
+    def test_11_one_node_rejects_condition_aborts_entire_group(self):
+        c = self.cluster
+        p1, p2, p3 = c.participants
+        self.seed_kv(p1, "cw-x", "good")
+        self.seed_kv(p2, "cw-x", "bad")  # 只有一个节点不满足
+        self.seed_kv(p3, "cw-x", "good")
+
+        tid = "t-cw-reject"
+        ops = [self.op("cw-x", "new", "good"), {"key": "cw-y", "value": "side"}]
+        res = c.submit(tid, ops)
+        self.assertEqual(res["state"], "aborted", res)
+        self.assertIn("p2", res["failures"])
+        self.assertEqual(
+            res["failures"]["p2"]["failed_condition"]["key"], "cw-x"
+        )
+
+        # 条件键保留各自旧值；同组中的无条件写也不能在任何节点生效。
+        expected = {"p1": "good", "p2": "bad", "p3": "good"}
+        for p in c.participants:
+            d = p.call("dump")
+            self.assertEqual(d["kv"].get("cw-x"), expected[p.name], d)
+            self.assertNotIn("cw-y", d["kv"])
+            self.assertEqual(d["locks"], {})
+            txn = next(t for t in d["txns"] if t["tid"] == tid)
+            self.assertEqual(txn["state"], "aborted")
+            self.assertEqual(txn["commit_count"], 0)
+
+        # 所有节点都满足同一条件后，新事务才可原子提交。
+        self.seed_kv(p2, "cw-x", "good")
+        ok = c.submit("t-cw-accept", [self.op("cw-x", "new", "good")])
+        self.assertEqual(ok["state"], "committed", ok)
+        for p in c.participants:
+            self.assertEqual(p.call("dump")["kv"]["cw-x"], "new")
+
+    def test_12_null_value_is_distinct_from_missing_key(self):
+        c = self.cluster
+        p1 = c.participants[0]
+
+        # 真实 NULL 值：行存在、value 为 None；不存在的 key：没有行。
+        self.seed_kv(p1, "cw-null", None)
+        got_null = p1.call("get", {"key": "cw-null"})
+        self.assertTrue(got_null["exists"], got_null)
+        self.assertIsNone(got_null["value"])
+        got_missing = p1.call("get", {"key": "cw-missing"})
+        self.assertFalse(got_missing["exists"], got_missing)
+        self.assertIsNone(got_missing["value"])
+
+        # expected=null 的含义是“必须不存在”；真实 NULL 不能冒充不存在。
+        rejected = c.submit(
+            "t-cw-null-reject",
+            [self.op("cw-null", "x", None), {"key": "cw-null-side", "value": "z"}],
+        )
+        self.assertEqual(rejected["state"], "aborted", rejected)
+        failure = rejected["failures"]["p1"]["failed_condition"]
+        self.assertTrue(failure["exists"])
+        self.assertIsNone(failure["actual"])
+        for p in c.participants:
+            d = p.call("dump")
+            self.assertNotIn("cw-null-side", d["kv"])
+            self.assertEqual(d["locks"], {})
+
+        # 缺失键满足 expected=null；写入 value=null 后，所有节点得到“存在但为 NULL”。
+        accepted = c.submit(
+            "t-cw-null-insert", [self.op("cw-new-null", None, None)]
+        )
+        self.assertEqual(accepted["state"], "committed", accepted)
+        for p in c.participants:
+            got = p.call("get", {"key": "cw-new-null"})
+            self.assertTrue(got["exists"], (p.name, got))
+            self.assertIsNone(got["value"])
+
+    def test_13_concurrent_conditional_commit_writes_are_atomic_cas(self):
+        c = self.cluster
+        for p in c.participants:
+            self.seed_kv(p, "cw-cas", "v0")
+
+        outcomes = {}
+        barrier = threading.Barrier(2)
+
+        def run_one(name, value):
+            barrier.wait()
+            for attempt in range(40):
+                tid = f"t-cw-cas-{name}-{attempt}"
+                try:
+                    res = c.submit(tid, [self.op("cw-cas", value, "v0")])
+                except rpc.RPCError:
+                    time.sleep(0.05)
+                    continue
+                if res["state"] in ("committed", "aborted"):
+                    outcomes[name] = (res["state"], tid)
+                    return
+                time.sleep(0.05)
+            outcomes[name] = ("pending", None)
+
+        threads = [
+            threading.Thread(target=run_one, args=("a", "v1")),
+            threading.Thread(target=run_one, args=("b", "v2")),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=20)
+
+        for name, (state, _tid) in outcomes.items():
+            self.assertIn(state, ("committed", "aborted"), (name, outcomes))
+        winners = [name for name in ("a", "b") if outcomes[name][0] == "committed"]
+        self.assertEqual(len(winners), 1, outcomes)
+        expected_final = {"a": "v1", "b": "v2"}[winners[0]]
+
+        # 两个期望 v0 的条件写只有一个全组成功；所有节点最终仍是同一个值。
+        final = {p.name: p.call("dump")["kv"]["cw-cas"] for p in c.participants}
+        self.assertEqual(len(set(final.values())), 1, final)
+        self.assertEqual(next(iter(final.values())), expected_final, final)
+
+        coord_dump = c.coord.call("dump")
+        coord_states = {t["tid"]: t["state"] for t in coord_dump["txns"]}
+        for p in c.participants:
+            for name in ("a", "b"):
+                tid = outcomes[name][1]
+                txn = next(t for t in p.call("dump")["txns"] if t["tid"] == tid)
+                self.assertEqual(txn["state"], coord_states[tid])
+
+    def test_14_same_tid_always_identifies_same_complete_request(self):
+        c = self.cluster
+        tid = "t-cw-identity"
+        ops = [self.op("cw-id", "one", None)]
+        first = c.submit(tid, ops)
+        self.assertEqual(first["state"], "committed", first)
+        request_id = first["request_id"]
+
+        duplicate = c.submit(tid, ops)
+        self.assertEqual(duplicate["state"], "committed")
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(duplicate["request_id"], request_id)
+
+        for changed in (
+            [self.op("cw-id", "two", None)],          # 改值
+            [self.op("cw-id", "one", "something")],   # 改条件
+            [{"key": "cw-id-other", "value": "one"}],  # 改键
+            ops + [{"key": "cw-extra", "value": "x"}], # 改请求集合
+        ):
+            with self.assertRaisesRegex(rpc.RPCError, "REQUEST_MISMATCH"):
+                c.submit(tid, changed)
+
+        st = c.coord.call("status", {"tid": tid})
+        self.assertEqual(st["state"], "committed")
+        self.assertEqual(st["request_id"], request_id)
+        self.assertEqual(st["ops"], sorted(ops, key=lambda o: o["key"]))
+
+        # 参与者也持久绑定完整请求，不把同 tid 的另一组 ops 当作重试。
+        with self.assertRaisesRegex(rpc.RPCError, "REQUEST_MISMATCH"):
+            c.participants[0].call(
+                "prepare",
+                {"tid": tid, "ops": [self.op("cw-id", "two", None)]},
+            )
+
+    def test_15_identity_survives_prepared_restart(self):
+        c = self.cluster
+        tid = "t-cw-restart-identity"
+        ops = [self.op("cw-restart", "one", None)]
+
+        c.coord.restart(
+            [{"point": "coordinator:commit:decision:before", "tid": tid}]
+        )
+        c.coord.wait_until_up()
+        try:
+            try:
+                c.submit(tid, ops)
+            except rpc.RPCError:
+                pass  # 协调者在进程内崩溃，连接重置是允许的响应形式
+            c.coord.wait_until_dead()
+            self.assertTrue(c.coord.crashed())
+            for p in c.participants:
+                self.assertEqual(
+                    p.call("status", {"tid": tid})["state"], "prepared"
+                )
+
+            c.coord.restart()
+            c.coord.wait_until_up()
+
+            # 重启后换值/换条件，不能借同一个 tid 得到原事务状态。
+            with self.assertRaisesRegex(rpc.RPCError, "REQUEST_MISMATCH"):
+                c.submit(tid, [self.op("cw-restart", "changed", None)])
+
+            # 原完整请求的重试仍由同一条日志推进；无持久提交决定 => abort。
+            retry = c.submit(tid, ops)
+            self.assertEqual(retry["state"], "aborted", retry)
+            self.assertEqual(
+                retry["request_id"],
+                json.dumps(
+                    sorted(ops, key=lambda o: o["key"]),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+            st = c.coord.call("status", {"tid": tid})
+            self.assertEqual(st["state"], "aborted")
+            self.assertEqual(st["ops"], sorted(ops, key=lambda o: o["key"]))
+            for p in c.participants:
+                d = p.call("dump")
+                self.assertNotIn("cw-restart", d["kv"])
+                self.assertEqual(d["locks"], {})
+                self.assertEqual(
+                    next(t for t in d["txns"] if t["tid"] == tid)["state"],
+                    "aborted",
+                )
+        finally:
+            if not c.coord.is_alive():
+                c.coord.restart()
+            c.coord.wait_until_up()
 
 
 if __name__ == "__main__":
