@@ -18,14 +18,21 @@ import json
 import os
 import sqlite3
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from . import rpc
+from .conditions import canonical_ops, evaluate, identity
 
 # txn_log.state
 PREPARED = "prepared"
 COMMITTED = "committed"
 ABORTED = "aborted"
+
+
+def _ops_fingerprint(ops_json: str) -> Optional[str]:
+    """从参与者日志里存的 ops JSON 反推请求身份；空 ops（补记中止）为 None。"""
+    ops = json.loads(ops_json)
+    return identity(ops) if ops else None
 
 
 class Participant:
@@ -89,29 +96,35 @@ class Participant:
     # ------------------------------------------------------------- 业务操作
 
     @staticmethod
-    def _normalize_ops(ops: Any) -> List[Tuple[str, str]]:
-        norm = [(str(o["key"]), str(o["value"])) for o in ops]
-        keys = [k for k, _ in norm]
-        if len(keys) != len(set(keys)):
-            raise ValueError("duplicate keys within one transaction")
-        return norm
+    def _reject_mismatch(tid: str, stored: Optional[str], incoming: str) -> None:
+        """同一 tid 已持久化的是另一个完整请求：明确拒绝，绝不按新内容执行。"""
+        raise rpc.RPCError(
+            f"REQUEST_MISMATCH {tid}: stored request {stored} "
+            f"!= incoming {incoming}"
+        )
 
     def _get_txn(self, conn: sqlite3.Connection, tid: str):
         return conn.execute(
             "SELECT state, ops, commit_count FROM txn_log WHERE tid=?", (tid,)
         ).fetchone()
 
-    def prepare(self, tid: str, ops: List[Tuple[str, str]]) -> Dict[str, Any]:
-        norm = self._normalize_ops(ops)
-        keys = [k for k, _ in norm]
+    def prepare(self, tid: str, ops: List[Dict[str, Any]]) -> Dict[str, Any]:
+        norm = canonical_ops(ops)
+        incoming_id = identity(norm)
+        keys = [o["key"] for o in norm]
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._get_txn(conn, tid)
                 if row is not None:
-                    # 幂等重试 / 恢复后协调者重发 prepare
-                    state = row[0]
+                    # 幂等重试 / 恢复后协调者重发 prepare：
+                    # 同一 tid 必须是同一个完整请求，否则拒绝。
+                    state, stored_ops_json, _ = row
+                    stored_id = _ops_fingerprint(stored_ops_json)
+                    if stored_id is not None and stored_id != incoming_id:
+                        conn.rollback()
+                        self._reject_mismatch(tid, stored_id, incoming_id)
                     if state == PREPARED:
                         vote = "yes"
                     elif state == COMMITTED:
@@ -119,7 +132,12 @@ class Participant:
                     else:
                         vote = "no"
                     conn.commit()
-                    return {"vote": vote, "state": state, "duplicate": True}
+                    return {
+                        "vote": vote,
+                        "state": state,
+                        "duplicate": True,
+                        "identity": incoming_id,
+                    }
 
                 # 投票 No 也要持久记录：检查键锁冲突
                 holders = conn.execute(
@@ -141,17 +159,41 @@ class Participant:
                         "state": ABORTED,
                         "reason": "lock conflict",
                         "conflicts": [{"key": k, "tid": t} for k, t in holders],
+                        "identity": incoming_id,
                     }
 
-                # 持久记录 Yes 票并锁定涉及的键
+                # 先把涉及的键全部锁定，再在同一事务/同一持锁状态下评估
+                # 条件：条件读到的值直到提交决定都受本事务的磁盘锁约束，
+                # 不存在“检查后、决定前被改写”的窗口。
+                conn.executemany(
+                    "INSERT INTO locks(key, tid) VALUES(?,?)",
+                    [(k, tid) for k in keys],
+                )
+                violation = evaluate(conn, norm)
+                if violation is not None:
+                    # 条件不满足：持久 No 票。键不属于本事务（已提交/中止
+                    # 的旧值必须原样保留），不留下锁。
+                    conn.execute("DELETE FROM locks WHERE tid=?", (tid,))
+                    conn.execute(
+                        "INSERT INTO txn_log(tid, state, ops, commit_count) "
+                        "VALUES(?,?,?,0)",
+                        (tid, ABORTED, json.dumps(norm)),
+                    )
+                    conn.commit()
+                    self._crash_if("participant:vote:after", tid)
+                    return {
+                        "vote": "no",
+                        "state": ABORTED,
+                        "reason": "condition not satisfied",
+                        "violation": violation,
+                        "identity": incoming_id,
+                    }
+
+                # 持久记录 Yes 票（锁已在上面插入，随本事务一起落盘）
                 conn.execute(
                     "INSERT INTO txn_log(tid, state, ops, commit_count) "
                     "VALUES(?,?,?,0)",
                     (tid, PREPARED, json.dumps(norm)),
-                )
-                conn.executemany(
-                    "INSERT INTO locks(key, tid) VALUES(?,?)",
-                    [(k, tid) for k in keys],
                 )
                 conn.commit()
             except BaseException:
@@ -162,9 +204,10 @@ class Participant:
 
         # Yes 票已 fsync，模拟“投票后、协调者决定前”崩溃
         self._crash_if("participant:vote:after", tid)
-        return {"vote": "yes", "state": PREPARED}
+        return {"vote": "yes", "state": PREPARED, "identity": incoming_id}
 
     def commit(self, tid: str) -> Dict[str, Any]:
+        applied_identity: Optional[str] = None
         with self._lock:
             conn = self._connect()
             try:
@@ -179,19 +222,25 @@ class Participant:
                         f"UNKNOWN_TXN {tid}: not prepared on {self.name}"
                     )
                 state, ops_json, _ = row
+                applied_identity = _ops_fingerprint(ops_json)
                 if state == COMMITTED:
                     conn.commit()
-                    return {"state": COMMITTED, "applied": False}
+                    return {
+                        "state": COMMITTED,
+                        "applied": False,
+                        "identity": _ops_fingerprint(ops_json),
+                    }
                 if state == ABORTED:
                     conn.rollback()
                     raise rpc.RPCError(f"CONFLICT {tid} already aborted on {self.name}")
 
-                # prepared -> 应用写入、记录提交、释放锁，原子完成
+                # prepared -> 应用写入、记录提交、释放锁，原子完成。
+                # 写入内容只能来自 prepare 时持久化的同一个完整请求。
                 ops = json.loads(ops_json)
                 conn.executemany(
                     "INSERT INTO kv(key, value) VALUES(?,?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    ops,
+                    [(o["key"], o["value"]) for o in ops],
                 )
                 conn.execute(
                     "UPDATE txn_log SET state=?, commit_count=1 WHERE tid=?",
@@ -218,9 +267,15 @@ class Participant:
 
         # 提交已落盘之后崩溃：协调者没收到 ack 会重试，幂等返回已提交
         self._crash_if("participant:commit:after", tid)
-        return {"state": COMMITTED, "applied": True}
+        return {
+            "state": COMMITTED,
+            "applied": True,
+            "identity": applied_identity,
+        }
 
     def abort(self, tid: str, ops: Optional[Any] = None) -> Dict[str, Any]:
+        norm = canonical_ops(ops) if ops else []
+        incoming_id = identity(norm) if norm else None
         with self._lock:
             conn = self._connect()
             try:
@@ -230,21 +285,28 @@ class Participant:
                 if row is None:
                     # prepare 可能没落盘（投票前崩溃）。补一条中止记录，
                     # 使重复 prepare 不可能再成功。
-                    if ops is None:
-                        ops = []
-                    norm = self._normalize_ops(ops) if ops else []
                     conn.execute(
                         "INSERT INTO txn_log(tid, state, ops, commit_count) "
                         "VALUES(?,?,?,0)",
                         (tid, ABORTED, json.dumps(norm)),
                     )
                 else:
-                    state = row[0]
+                    state, stored_ops_json, _ = row
                     if state == COMMITTED:
                         conn.rollback()
                         raise rpc.RPCError(
                             f"CONFLICT {tid} already committed on {self.name}"
                         )
+                    stored_id = _ops_fingerprint(stored_ops_json)
+                    if (
+                        incoming_id is not None
+                        and stored_id is not None
+                        and stored_id != incoming_id
+                    ):
+                        # 同一个 tid 带着不同请求来要求中止：拒绝，
+                        # 持久状态对应的是哪次约定不能被模糊掉。
+                        conn.rollback()
+                        self._reject_mismatch(tid, stored_id, incoming_id)
                     conn.execute(
                         "UPDATE txn_log SET state=? WHERE tid=?", (ABORTED, tid)
                     )
@@ -257,21 +319,28 @@ class Participant:
                 conn.close()
 
         self._crash_if("participant:abort:after", tid)
-        return {"state": ABORTED}
+        return {"state": ABORTED, "identity": incoming_id}
 
     def status(self, tid: str) -> Dict[str, Any]:
         conn = self._connect()
         try:
             row = self._get_txn(conn, tid)
             if row is None:
-                return {"state": "unknown"}
+                return {"state": "unknown", "identity": None}
+            state, ops_json, _ = row
             locks = [
                 r[0]
                 for r in conn.execute(
                     "SELECT key FROM locks WHERE tid=? ORDER BY key", (tid,)
                 )
             ]
-            return {"state": row[0], "locked_keys": locks}
+            return {
+                "state": state,
+                "locked_keys": locks,
+                # 状态始终指向它实际持久的那一个完整请求，
+                # 调用方可据此证明“执行的是哪次约定”。
+                "identity": _ops_fingerprint(ops_json),
+            }
         finally:
             conn.close()
 
@@ -282,6 +351,9 @@ class Participant:
             lock = conn.execute("SELECT tid FROM locks WHERE key=?", (key,)).fetchone()
             return {
                 "key": key,
+                # exists 显式区分“不存在”与“存在但值为空串”；
+                # value 列为 NOT NULL，不存在时 value 为 null。
+                "exists": row is not None,
                 "value": row[0] if row else None,
                 "locked_by": lock[0] if lock else None,
             }
@@ -294,9 +366,14 @@ class Participant:
             kv = dict(conn.execute("SELECT key, value FROM kv").fetchall())
             locks = dict(conn.execute("SELECT key, tid FROM locks").fetchall())
             txns = [
-                {"tid": t, "state": s, "commit_count": c}
-                for t, s, c in conn.execute(
-                    "SELECT tid, state, commit_count FROM txn_log"
+                {
+                    "tid": t,
+                    "state": s,
+                    "commit_count": c,
+                    "identity": _ops_fingerprint(o),
+                }
+                for t, s, o, c in conn.execute(
+                    "SELECT tid, state, ops, commit_count FROM txn_log"
                 )
             ]
             stat = conn.execute(

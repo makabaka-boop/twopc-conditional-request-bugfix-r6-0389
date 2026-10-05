@@ -161,6 +161,13 @@ class Coordinator:
             "SELECT state, ops FROM txn_log WHERE tid=?", (tid,)
         ).fetchone()
 
+    def _identity_of(self, conn: sqlite3.Connection, tid: str) -> Optional[str]:
+        """协调者日志中该 tid 实际持久的完整请求身份。"""
+        from .conditions import identity
+
+        row = self._load(conn, tid)
+        return identity(json.loads(row[1])) if row else None
+
     def _save_state(self, conn: sqlite3.Connection, tid: str, state: str) -> None:
         conn.execute(
             "UPDATE txn_log SET state=?, updated_at=? WHERE tid=?",
@@ -213,15 +220,28 @@ class Coordinator:
     def _run_transaction(self, tid: str, ops: List[Dict[str, str]]) -> Dict[str, Any]:
         from .conditions import canonical_ops, identity
 
-        ops = canonical_ops(ops)
-        keys = self._ops_keys(ops)
+        norm = canonical_ops(ops)
+        incoming_id = identity(norm)
+        keys = self._ops_keys(norm)
         conn = self._connect()
+        existed = False
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = self._load(conn, tid)
             if row is not None:
-                # 已见过的 tid（客户端重试 / 重启后推进）：按日志状态走
-                state = row[0]
+                # 已见过的 tid（客户端重试 / 重启后推进）：身份必须一致，
+                # 持久日志里是哪个完整请求，就只能推进哪一个。
+                state, stored_ops_json = row
+                stored_id = identity(json.loads(stored_ops_json))
+                if stored_id != incoming_id:
+                    conn.rollback()
+                    raise rpc.RPCError(
+                        f"REQUEST_MISMATCH {tid}: stored request {stored_id} "
+                        f"!= incoming {incoming_id}"
+                    )
+                # 之后一律使用日志里持久化的请求内容
+                ops = json.loads(stored_ops_json)
+                existed = True
                 conn.commit()
             else:
                 # 新事务：协调者作为冲突串行化点，先拿全部键的所有权
@@ -231,6 +251,7 @@ class Coordinator:
                         "tid": tid,
                         "state": "pending",
                         "reason": "keys busy; retry later",
+                        "identity": incoming_id,
                         "waiting_keys": [
                             k for k in keys if self._key_owner.get(k) not in (None, tid)
                         ],
@@ -240,17 +261,34 @@ class Coordinator:
                     row2 = self._load(conn, tid)
                     if row2 is not None:
                         # 等待键锁期间恢复线程可能已处理该 tid
-                        state = row2[0]
+                        state, stored_ops_json = row2
+                        stored_id = identity(json.loads(stored_ops_json))
+                        if stored_id != incoming_id:
+                            conn.rollback()
+                            raise rpc.RPCError(
+                                f"REQUEST_MISMATCH {tid}: stored request "
+                                f"{stored_id} != incoming {incoming_id}"
+                            )
+                        ops = json.loads(stored_ops_json)
+                        existed = True
                         conn.commit()
                     else:
-                        # 先把“开始两阶段提交”记入日志
+                        # 先把“开始两阶段提交”连同完整请求（含全部条件）
+                        # 记入日志：重启后同一个 tid 仍是同一个完整请求。
                         conn.execute(
                             "INSERT INTO txn_log(tid, state, ops, "
                             "created_at, updated_at) VALUES(?,?,?,?,?)",
-                            (tid, PREPARING, json.dumps(ops), time.time(), time.time()),
+                            (
+                                tid,
+                                PREPARING,
+                                json.dumps(norm),
+                                time.time(),
+                                time.time(),
+                            ),
                         )
                         conn.commit()
                         state = PREPARING
+                        ops = norm
                 except BaseException:
                     self._release_keys(tid, keys)
                     raise
@@ -260,34 +298,63 @@ class Coordinator:
         finally:
             conn.close()
 
-        if row is not None or state != PREPARING:
+        if existed or state != PREPARING:
             if state in FINAL:
-                return {"tid": tid, "state": state, "duplicate": True}
+                return {
+                    "tid": tid,
+                    "state": state,
+                    "duplicate": True,
+                    "identity": incoming_id,
+                }
             if state == COMMITTING:
                 return self._finish_commit(tid)
             if state == ABORTING:
-                return self._finish_abort(tid)
+                return self._finish_abort(tid, ops)
             # preparing 残留行（协调者在 prepare 期间崩溃过）：推定中止
             return self._abort_from_preparing(tid, ops)
 
         # ---------- 阶段 1：prepare（投票） ----------
+        # 条件不在协调者侧预检：预检只读到某一个参与者、且不持锁——
+        # 节点原值不一致时会漏判，检查与决定之间值也可能被改写（TOCTOU）。
+        # 每个条件由对应参与者在自己的持锁写事务里评估（participant.prepare），
+        # 从读取当前值到持久投票都在同一磁盘事务内，值全程受锁约束。
         self._crash_if("coordinator:prepare:after", tid)
-        first = self.participants[0]
-        for op in ops:
-            if "expected" in op:
-                actual = rpc.call(
-                    (first["host"], first["port"]), "get", {"key": op["key"]}
-                )
-                if actual["value"] != op["expected"]:
-                    return self._abort_after_vote(tid, ops)
         votes = self._broadcast("prepare", {"tid": tid, "ops": ops})
         yes = all(
             v.get("ok") and v["result"].get("vote") == "yes" for v in votes.values()
         ) and len(votes) == len(self.participants)
 
         if not yes:
-            return self._abort_after_vote(tid, ops)
+            # 任一节点拒绝（含其本地条件不满足 / 不可达）：整组不应用写入。
+            result = self._abort_after_vote(tid, ops)
+            result["rejected_by"] = self._rejections(votes)
+            return result
         return self._commit_after_vote(tid, ops)
+
+    @staticmethod
+    def _rejections(votes: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """汇总各参与者的 No 票/不可达原因，回带给客户端作为拒绝证据。"""
+        out = []
+        for name, v in votes.items():
+            if v.get("ok") and v["result"].get("vote") == "yes":
+                continue
+            if not v.get("ok"):
+                out.append(
+                    {
+                        "participant": name,
+                        "reason": "unreachable",
+                        "error": v.get("error"),
+                    }
+                )
+                continue
+            r = v["result"]
+            item = {"participant": name, "reason": r.get("reason", "voted no")}
+            if r.get("violation") is not None:
+                item["violation"] = r["violation"]
+            if r.get("conflicts"):
+                item["conflicts"] = r["conflicts"]
+            out.append(item)
+        return out
 
     def _persist_decision(self, tid: str, state: str) -> None:
         conn = self._connect()
@@ -316,6 +383,7 @@ class Coordinator:
         conn = self._connect()
         try:
             acked = self._acked(conn, tid)
+            identity_hex = self._identity_of(conn, tid)
         finally:
             conn.close()
         results = self._broadcast("commit", {"tid": tid}, need_acks=acked)
@@ -344,12 +412,13 @@ class Coordinator:
 
         if all_acked:
             self._release_keys(tid, self._keys_of_txn(tid))
-            return {"tid": tid, "state": COMMITTED}
+            return {"tid": tid, "state": COMMITTED, "identity": identity_hex}
         # 拿不准（参与者宕机/拒绝）：保持待决，绝不返回成功；键继续持有，
         # 由 sweeper 在参与者恢复后补完并释放。
         return {
             "tid": tid,
             "state": "pending",
+            "identity": identity_hex,
             "waiting_on": sorted({p["name"] for p in self.participants} - acked),
         }
 
@@ -375,6 +444,9 @@ class Coordinator:
             finally:
                 conn.close()
 
+        from .conditions import identity as _identity
+
+        identity_hex = _identity(ops) if ops else None
         self._crash_if("coordinator:abort:notify:before", tid)
         conn = self._connect()
         try:
@@ -414,7 +486,7 @@ class Coordinator:
         # 可能在某个还没处理完 abort 的参与者处拿到不一致的顺序。
         if all_acked:
             self._release_keys(tid, self._keys_of_txn(tid))
-        return {"tid": tid, "state": ABORTED}
+        return {"tid": tid, "state": ABORTED, "identity": identity_hex}
 
     # ----------------------------------------------------------- 恢复/扫描
 
@@ -474,14 +546,19 @@ class Coordinator:
         try:
             row = self._load(conn, tid)
             if row is None:
-                return {"tid": tid, "state": "unknown"}
-            state = row[0]
+                return {"tid": tid, "state": "unknown", "identity": None}
+            state, ops_json = row
+            from .conditions import identity as _identity
+
+            ident = _identity(json.loads(ops_json))
             if state == COMMITTING:
                 state = "pending"  # 决定已落盘但未全部确认
             acked = sorted(self._acked(conn, tid))
             return {
                 "tid": tid,
                 "state": state,
+                # 同一 tid 的状态始终对应它持久日志里的同一个完整请求
+                "identity": ident,
                 "acked_by": acked,
                 "waiting_on": (
                     sorted({p["name"] for p in self.participants} - set(acked))
@@ -493,13 +570,16 @@ class Coordinator:
             conn.close()
 
     def dump(self) -> Dict[str, Any]:
+        from .conditions import identity as _identity
+
         conn = self._connect()
         try:
+            rows = conn.execute(
+                "SELECT tid, state, ops FROM txn_log ORDER BY created_at"
+            ).fetchall()
             txns = [
-                {"tid": t, "state": s}
-                for t, s in conn.execute(
-                    "SELECT tid, state FROM txn_log ORDER BY created_at"
-                )
+                {"tid": t, "state": s, "identity": _identity(json.loads(o))}
+                for t, s, o in rows
             ]
             acks = [
                 {"tid": t, "participant": p}

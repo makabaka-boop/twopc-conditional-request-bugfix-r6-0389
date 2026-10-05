@@ -725,5 +725,400 @@ class TwoPCTests(unittest.TestCase):
                 self.assertIsNone(final_values[key], key)
 
 
+# ------------------- 11. 条件写：每个节点都必须满足，任一拒绝全组不写
+
+def ckv(key, value, expected=...):
+    op = {"key": key, "value": value}
+    if expected is not ...:
+        op["expected"] = expected
+    return op
+
+
+def _direct_set(db_path: Path, key: str, value) -> None:
+    """绕过集群直接改某个参与者的 SQLite（模拟节点原值不一致）。"""
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    try:
+        if value is None:
+            conn.execute("DELETE FROM kv WHERE key=?", (key,))
+        else:
+            conn.execute(
+                "INSERT INTO kv(key, value) VALUES(?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class ConditionalWriteTests(unittest.TestCase):
+    cluster: Cluster = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cluster = Cluster(n_participants=3)
+        cls.cluster.start_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.cluster.stop_all()
+
+    def test_11_every_participant_checks_conditions(self):
+        c = self.cluster
+        p1, p2, p3 = c.participants
+        # 三个节点先一致写入 cw@k = base
+        ops_seed = [ckv("cw@k", "base")]
+        self.assertEqual(c.submit("cw-seed", ops_seed)["state"], "committed")
+        for p in c.participants:
+            self.assertEqual(p.call("get", {"key": "cw@k"})["value"], "base")
+
+        # 让 p1 与其它节点不一致：它本地是 diverged
+        _direct_set(p1.db, "cw@k", "diverged")
+
+        # 条件 expected=base：只有 p1 不满足 -> 整组必须中止，
+        # 任何节点（含满足条件的 p2/p3）都不应用新值
+        res = c.submit("cw-div", [ckv("cw@k", "new", "base")])
+        self.assertEqual(res["state"], "aborted", res)
+        rejected = {r["participant"]: r for r in res["rejected_by"]}
+        self.assertIn("p1", rejected)
+        self.assertEqual(rejected["p1"]["reason"], "condition not satisfied")
+        v = rejected["p1"]["violation"]
+        self.assertEqual(v["key"], "cw@k")
+        self.assertEqual(v["expected"], "base")
+        self.assertEqual(v["actual"], "diverged")
+        self.assertTrue(v["exists"])
+        # 旧值原样保留：分叉也保留，满足条件的节点也没被写入
+        self.assertEqual(p1.call("get", {"key": "cw@k"})["value"], "diverged")
+        self.assertEqual(p2.call("get", {"key": "cw@k"})["value"], "base")
+        self.assertEqual(p3.call("get", {"key": "cw@k"})["value"], "base")
+        for p in c.participants:
+            self.assertEqual(p.call("dump")["locks"], {})
+            txn = next(t for t in p.call("dump")["txns"] if t["tid"] == "cw-div")
+            self.assertEqual(txn["state"], "aborted")
+
+        # 条件与无条件写混合：无条件写不能绕过条件。
+        res = c.submit(
+            "cw-mix-fail",
+            [ckv("cw@free", "x"), ckv("cw@k", "z", "base")],
+        )
+        self.assertEqual(res["state"], "aborted", res)
+        self.assertIn("p1", {r["participant"] for r in res["rejected_by"]})
+        for p in c.participants:
+            got = p.call("get", {"key": "cw@free"})
+            self.assertFalse(got["exists"], f"unconditional write applied on {p.name}")
+            self.assertEqual(p.call("dump")["locks"], {})
+
+        # 消除分叉后（新 tid，条件匹配全部节点的当前值）才整体提交
+        _direct_set(p1.db, "cw@k", "base")
+        res = c.submit(
+            "cw-mix-ok",
+            [ckv("cw@free2", "y"), ckv("cw@k", "new", "base")],
+        )
+        self.assertEqual(res["state"], "committed", res)
+        for p in c.participants:
+            self.assertEqual(p.call("get", {"key": "cw@k"})["value"], "new")
+            self.assertEqual(p.call("get", {"key": "cw@free2"})["value"], "y")
+            self.assertEqual(p.call("dump")["locks"], {})
+
+    # ------------------- 12. 空字符串与不存在可区分 -------------------
+
+    def test_12_empty_string_distinct_from_absent(self):
+        c = self.cluster
+        p = c.participants[0]
+
+        # 空字符串是合法存储值
+        self.assertEqual(
+            c.submit("cw-empty", [ckv("cw@e", "")])["state"], "committed"
+        )
+        got = p.call("get", {"key": "cw@e"})
+        self.assertTrue(got["exists"])
+        self.assertEqual(got["value"], "")
+
+        # 不存在的键：exists=False，与空串明确区分
+        missing = p.call("get", {"key": "cw@never"})
+        self.assertFalse(missing["exists"])
+        self.assertIsNone(missing["value"])
+
+        # expected=null 要求不存在：键存在（即使是空串）-> 全组中止
+        res = c.submit("cw-null-on-existing", [ckv("cw@e", "x", None)])
+        self.assertEqual(res["state"], "aborted", res)
+        self.assertEqual(
+            {r["participant"] for r in res["rejected_by"]},
+            {q.name for q in c.participants},
+        )
+        for r in res["rejected_by"]:
+            self.assertTrue(r["violation"]["exists"])
+            self.assertEqual(r["violation"]["actual"], "")
+            self.assertIsNone(r["violation"]["expected"])
+        self.assertEqual(p.call("get", {"key": "cw@e"})["value"], "")
+
+        # expected=null 对不存在的键 -> 提交
+        self.assertEqual(
+            c.submit("cw-null-on-absent", [ckv("cw@abs", "v", None)])["state"],
+            "committed",
+        )
+        # expected="" 只匹配空串，不匹配不存在，也不匹配别的值
+        self.assertEqual(
+            c.submit("cw-empty-expect", [ckv("cw@e", "s", "")])["state"],
+            "committed",
+        )
+        res = c.submit(
+            "cw-empty-expect-absent", [ckv("cw@never", "s", "")]
+        )
+        self.assertEqual(res["state"], "aborted", res)
+        r = res["rejected_by"][0]["violation"]
+        self.assertFalse(r["exists"])
+        self.assertIsNone(r["actual"])
+        self.assertEqual(r["expected"], "")
+
+    # ------------------- 13. 同一 tid 始终是同一个完整请求 -------------------
+
+    def test_13_tid_identity_persists_across_restart(self):
+        c = self.cluster
+        ops = [ckv("cw@id", "1", "0")]
+        # 先让键存在
+        c.submit("cw-id-seed", [ckv("cw@id", "0")])
+        res = c.submit("cw-id-txn", ops)
+        self.assertEqual(res["state"], "committed", res)
+        ident = res["identity"]
+        self.assertEqual(c.coord.call("status", {"tid": "cw-id-txn"})["identity"], ident)
+        for p in c.participants:
+            pst = p.call("status", {"tid": "cw-id-txn"})
+            self.assertEqual(pst["identity"], ident)
+            txn = next(
+                t for t in p.call("dump")["txns"] if t["tid"] == "cw-id-txn"
+            )
+            self.assertEqual(txn["identity"], ident)
+
+        # 换值：拒绝
+        with self.assertRaises(rpc.RPCError) as cm:
+            c.submit("cw-id-txn", [ckv("cw@id", "999", "0")])
+        self.assertIn("REQUEST_MISMATCH", str(cm.exception))
+        # 换条件：拒绝
+        with self.assertRaises(rpc.RPCError):
+            c.submit("cw-id-txn", [ckv("cw@id", "1", "000")])
+        # 加/减一个 op 也是不同请求：拒绝
+        with self.assertRaises(rpc.RPCError):
+            c.submit(
+                "cw-id-txn",
+                [ckv("cw@id", "1", "0"), ckv("cw@id2", "2")],
+            )
+        # 原请求原样重试：返回同一终态、同一身份，绝不二次执行
+        again = c.submit("cw-id-txn", ops)
+        self.assertEqual(again["state"], "committed")
+        self.assertTrue(again["duplicate"])
+        self.assertEqual(again["identity"], ident)
+        for p in c.participants:
+            txn = next(
+                t for t in p.call("dump")["txns"] if t["tid"] == "cw-id-txn"
+            )
+            self.assertEqual(txn["commit_count"], 1)
+
+        # 协调者重启后，持久日志里的身份仍然生效
+        c.coord.restart()
+        c.coord.wait_until_up()
+        with self.assertRaises(rpc.RPCError) as cm:
+            c.submit("cw-id-txn", [ckv("cw@id", "999", "0")])
+        self.assertIn("REQUEST_MISMATCH", str(cm.exception))
+        same = c.submit("cw-id-txn", ops)
+        self.assertEqual(same["identity"], ident)
+        self.assertEqual(
+            c.coord.call("status", {"tid": "cw-id-txn"})["identity"], ident
+        )
+
+    # ------------- 14. 条件事务投票后崩溃：待决、身份跨崩溃不变 -------------
+
+    def test_14_conditional_txn_crash_after_vote(self):
+        c = self.cluster
+        p2 = c.participants[1]
+        tid = "cw-cond-crash"
+        c.submit("cw-cond-seed", [ckv("cw@cc", "0")])
+        p2.restart([{"point": "participant:vote:after", "tid": tid}])
+        try:
+            res = c.submit(tid, [ckv("cw@cc", "1", "0")])
+            # p2 投票后崩溃，协调者收不齐票 -> 持久中止
+            self.assertEqual(res["state"], "aborted", res)
+            p2.wait_until_dead()
+            self.assertTrue(p2.crashed())
+
+            # p2 磁盘上：prepared 持锁待决，且落盘的是**完整条件请求**
+            import sqlite3
+
+            conn = sqlite3.connect(p2.db)
+            try:
+                state, ops_json = conn.execute(
+                    "SELECT state, ops FROM txn_log WHERE tid=?", (tid,)
+                ).fetchone()
+                locked = conn.execute(
+                    "SELECT key FROM locks WHERE tid=?", (tid,)
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(state, "prepared")
+            self.assertEqual(locked, [("cw@cc",)])
+            stored_ops = json.loads(ops_json)
+            self.assertEqual(stored_ops[0]["expected"], "0")
+            self.assertEqual(stored_ops[0]["value"], "1")
+
+            # 重启：协调者补通知 abort；绝不自行猜测
+            p2.restart()
+            p2.wait_until_up()
+            self.assertEqual(c.wait_final(tid), "aborted")
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                d = p2.call("dump")
+                t = next(x for x in d["txns"] if x["tid"] == tid)
+                if t["state"] == "aborted" and not d["locks"]:
+                    break
+                time.sleep(0.05)
+            d = p2.call("dump")
+            self.assertEqual(
+                next(x for x in d["txns"] if x["tid"] == tid)["state"], "aborted"
+            )
+            self.assertEqual(d["locks"], {})
+            self.assertEqual(d["kv"].get("cw@cc"), "0")  # 旧值保留
+
+            # 参与者收到同一 tid 但“换了请求”的 prepare：必须拒绝，
+            # 不能让新约定冒充已持久中止的原约定。
+            with self.assertRaises(rpc.RPCError) as cm:
+                p2.call(
+                    "prepare",
+                    {"tid": tid, "ops": [{"key": "cw@cc", "value": "2", "expected": "0"}]},
+                )
+            self.assertIn("REQUEST_MISMATCH", str(cm.exception))
+
+            # 协调者侧：中止态的 tid 换请求同样拒绝
+            with self.assertRaises(rpc.RPCError) as cm3:
+                c.submit(tid, [ckv("cw@cc", "2", "0")])
+            self.assertIn("REQUEST_MISMATCH", str(cm3.exception))
+        finally:
+            if not p2.is_alive():
+                p2.restart()
+            p2.wait_until_up()
+
+
+# ------------------- 15. 参与者本地：条件检查与锁同一原子事务 -------------------
+
+class ParticipantConditionAtomTests(unittest.TestCase):
+    """不起网络/子进程，直接验证参与者 prepare 的关键不变量：
+
+    * 条件评估与锁插入在同一个磁盘事务里——投 yes 的事务持锁期间，
+      竞争事务不可能改写条件所约束的值（它只能拿到 lock-conflict no）；
+    * 条件不满足投持久 no，不持锁、不写数据；
+    * 同一 tid 的不同 prepare 请求被 REQUEST_MISMATCH 拒绝；
+    * 空串/不存在/期望值三态判定正确。
+    """
+
+    def setUp(self):
+        import tempfile
+        from twopc.participant import Participant
+
+        self.tmp = tempfile.mkdtemp(prefix="twopc-unit-")
+        self.db = os.path.join(self.tmp, "p.db")
+        self.p = Participant("unit", self.db)
+
+    def _seed(self, key, value):
+        tid = f"seed-{key}"
+        self.assertEqual(
+            self.p.prepare(tid, [{"key": key, "value": value}])["vote"], "yes"
+        )
+        self.p.commit(tid)
+
+    def test_15a_checked_value_locked_until_decision(self):
+        self._seed("k", "1")
+        yes = self.p.prepare("A", [{"key": "k", "value": "2", "expected": "1"}])
+        self.assertEqual(yes["vote"], "yes")
+
+        # A 已持锁待决：竞争事务 B 同一键只能拿到 lock-conflict 的持久 no，
+        # 无法在 A 的条件与决定之间写入新值。
+        no = self.p.prepare("B", [{"key": "k", "value": "9"}])
+        self.assertEqual(no["vote"], "no")
+        self.assertEqual(no["reason"], "lock conflict")
+        with self.assertRaises(Exception):
+            self.p.commit("B")  # B 已中止，不能提交
+        # 待决期间读出来的仍是旧值，锁属于 A
+        got = self.p.get("k")
+        self.assertEqual(got["value"], "1")
+        self.assertEqual(got["locked_by"], "A")
+
+        self.p.commit("A")
+        self.assertEqual(self.p.get("k")["value"], "2")
+        self.assertIsNone(self.p.get("k")["locked_by"])
+        d = self.p.dump()
+        self.assertEqual(d["locks"], {})
+        self.assertEqual(
+            next(t for t in d["txns"] if t["tid"] == "A")["commit_count"], 1
+        )
+
+    def test_15b_failed_condition_is_durable_no_without_lock(self):
+        self._seed("k", "1")
+        no = self.p.prepare("F", [{"key": "k", "value": "2", "expected": "WRONG"}])
+        self.assertEqual(no["vote"], "no")
+        self.assertEqual(no["reason"], "condition not satisfied")
+        self.assertEqual(no["violation"]["actual"], "1")
+        self.assertTrue(no["violation"]["exists"])
+        # 不持锁、旧值不动
+        self.assertIsNone(self.p.get("k")["locked_by"])
+        self.assertEqual(self.p.get("k")["value"], "1")
+        self.assertEqual(self.p.status("F")["state"], "aborted")
+        # 后续不冲突的事务仍能用同一个键
+        self.assertEqual(
+            self.p.prepare("G", [{"key": "k", "value": "3", "expected": "1"}])["vote"],
+            "yes",
+        )
+        self.p.commit("G")
+        self.assertEqual(self.p.get("k")["value"], "3")
+
+    def test_15c_empty_absent_expected_tri_state(self):
+        self._seed("e", "")
+        # 期望不存在，但键存在（空串）-> no，actual 报空串且 exists=True
+        no = self.p.prepare("N1", [{"key": "e", "value": "x", "expected": None}])
+        self.assertEqual(no["vote"], "no")
+        self.assertEqual(no["violation"]["actual"], "")
+        self.assertTrue(no["violation"]["exists"])
+        # 期望不存在、确实不存在 -> yes
+        yes = self.p.prepare("N2", [{"key": "absent", "value": "v", "expected": None}])
+        self.assertEqual(yes["vote"], "yes")
+        self.p.commit("N2")
+        self.assertTrue(self.p.get("absent")["exists"])
+        # 期望空串匹配空串 -> yes
+        self.assertEqual(
+            self.p.prepare("N3", [{"key": "e", "value": "y", "expected": ""}])[
+                "vote"
+            ],
+            "yes",
+        )
+
+    def test_15d_same_tid_different_request_rejected(self):
+        self._seed("k", "1")
+        self.assertEqual(
+            self.p.prepare("S", [{"key": "k", "value": "2", "expected": "1"}])[
+                "vote"
+            ],
+            "yes",
+        )
+        # 改值 -> 拒绝
+        with self.assertRaises(Exception) as cm:
+            self.p.prepare("S", [{"key": "k", "value": "8", "expected": "1"}])
+        self.assertIn("REQUEST_MISMATCH", str(cm.exception))
+        # 改条件 -> 拒绝
+        with self.assertRaises(Exception) as cm:
+            self.p.prepare("S", [{"key": "k", "value": "2", "expected": "7"}])
+        self.assertIn("REQUEST_MISMATCH", str(cm.exception))
+        # 原请求 -> 幂等 yes
+        dup = self.p.prepare(
+            "S", [{"key": "k", "value": "2", "expected": "1"}]
+        )
+        self.assertEqual(dup["vote"], "yes")
+        self.assertTrue(dup["duplicate"])
+        self.p.commit("S")
+        # 提交后换请求 prepare 仍然拒绝
+        with self.assertRaises(Exception) as cm:
+            self.p.prepare("S", [{"key": "k", "value": "8", "expected": "2"}])
+        self.assertIn("REQUEST_MISMATCH", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

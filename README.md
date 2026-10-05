@@ -24,6 +24,7 @@ tests/
 | 协调者先持久决定再通知 | `commit/abort` 决定先写入协调者日志（fsync），之后才向任何参与者发 commit/abort |
 | 协调者不可达时参与者保持待决 | prepared 的参与者重启后仍是 prepared 且继续持锁，没有“超时自动提交/中止”，只能等协调者重发决定 |
 | 相同事务 ID 重试不重复执行 | 协调者按 tid 串行化（进行中的并发重试直接返回 `pending`）；参与者 commit/abort 幂等，已提交事务 `commit_count` 恒为 1 |
+| 同一 tid 必须是同一个完整请求 | 完整请求（全部 key/value/expected）规范化后取 sha256 作为 `identity`，随协调者日志与参与者 `txn_log` 一起落盘；重试/重启后值或条件不同一律返回 `REQUEST_MISMATCH` 错误，绝不按新内容执行 |
 | 成功响应 ⇒ 全部参与者最终可恢复到提交 | 只有所有参与者 ack（本地提交已落盘）才返回 `committed`；ack 不全一律 `pending`，由后台 sweeper 补完 |
 | 无法确定时返回待决 | 参与者连接失败/UNKNOWN_TXN 等一律不假装成功，返回 `pending` + `waiting_on` |
 | 重启后按日志恢复 | 协调者启动与后台扫描：`committing→补 commit`、`aborting→补 abort`、残留 `preparing→推定中止`；通知进度按 `txn_ack` 断点续传 |
@@ -94,11 +95,24 @@ python tests/test_2pc.py        # 不需要 pytest
 python -m pytest tests/test_2pc.py -v
 ```
 
-10 个用例：基本提交、锁冲突全组中止、重复 tid 幂等（提交只应用一次）、
-参与者投票后崩溃持锁待决、参与者 commit 落盘后 ack 前崩溃（不假成功）、
-参与者收到 commit 前崩溃（重启补提交）、协调者决定落盘前/后崩溃、
-协调者 prepare 中崩溃推定中止，以及 8 个竞争事务线程交错 + 协调者中途
-被 kill 的压力场景，校验：
+18 个用例：10 个 2PC 基础/崩溃恢复用例（基本提交、锁冲突全组中止、
+重复 tid 幂等、投票后崩溃持锁待决、commit 落盘后 ack 前崩溃不假成功、
+收到 commit 前崩溃重启补提交、协调者决定落盘前/后崩溃、prepare 中崩溃
+推定中止、8 个竞争事务线程交错 + 协调者中途被 kill 的压力场景），
+以及 8 个条件写用例：
+
+11. 节点原值不一致时只有一端不满足也整组中止，旧值/分叉保留，
+    条件与无条件写混合同样全组不写；
+12. 空字符串与键不存在三态可区分（`expected` 为字符串/null/缺省）；
+13. 同一 tid 换值/换条件/增删 op 被 `REQUEST_MISMATCH` 拒绝，
+    协调者重启后身份仍生效，原请求重试幂等且 `commit_count==1`；
+14. 条件事务投票后崩溃：参与者磁盘上保留的是完整条件请求，重启补
+    中止、旧值保留，换请求的 prepare 被拒；
+15a–d（参与者进程内单元用例）检查与持锁同一原子事务（持锁待决期间
+    竞争者只能拿 lock-conflict No）、条件失败投持久 No 不持锁不写、
+    空串/不存在/期望值三态、同一 tid 不同 prepare 被拒。
+
+端到端用例校验：
 
 1. 每个事务在所有参与者上的终态与协调者一致（无部分提交）；
 2. 无残留/丢失锁；
@@ -106,4 +120,32 @@ python -m pytest tests/test_2pc.py -v
 4. 每个键在所有参与者上的最终值一致，且等于某个已提交事务写入的值。
 
 ## Conditional writes
-A submit operation may include `expected`: a string means the local key must equal it, null means the key must not exist, and omitting it is an unconditional put. Every participant must satisfy every condition in its own durable state for the transaction to commit. Preparation owns the checked keys until the durable decision. Retries with the same transaction ID refer to the same complete conditional request, across restarts; altered values or conditions are rejected. Failed conditions vote No durably and release the transaction through the existing abort path.
+
+A submit operation may include `expected` on each op:
+
+- `expected` 为**字符串**：该参与者本地的键当前值必须逐字节等于它；
+- `expected` 为 `null`：键必须**不存在**（`exists=false`；空字符串 `""`
+  是与“不存在”不同的合法值）；
+- 不写 `expected`：无条件 put。
+
+语义与实现要点：
+
+1. **每个参与者独立检查全部条件**。条件评估发生在参与者 `prepare` 的
+   同一个 `BEGIN IMMEDIATE` 磁盘事务里：先插入本事务全部键的磁盘锁，
+   再在持锁状态下读取当前值比对，然后才落盘投票。因此“判断条件 →
+   形成持久决定”期间条件所约束的值一直被本事务锁住，不存在检查后被
+   其它事务改写的窗口；协调者侧**不做**只读预检（那只会读到某一个
+   节点且不持锁，节点原值不一致时漏判）。
+2. **任一节点拒绝则整组不应用写入**。条件不满足投持久 No 票（不持锁、
+   旧值原样保留），走既有 abort 路径；同一事务里条件写与无条件写
+   混合时，无条件写也不会在条件失败的节点上生效。中止响应带
+   `rejected_by`，列出每个拒绝节点及其 `violation`
+   （`key/expected/actual/exists`）。
+3. **空值与不存在可区分**。`value` 列 NOT NULL；参与者 `get` 返回
+   `exists`（不存在时 `exists=false, value=null`），空串则
+   `exists=true, value=""`。非字符串 value 在入口直接拒绝。
+4. **同一事务编号永远对应同一个完整请求**。规范化后的请求身份
+   `identity`（sha256）随协调者与各参与者日志持久化；协调者 `submit`
+   与参与者 `prepare/abort` 都会比对身份，换值/换条件/增删 op 的重试
+   或重启后请求得到 `REQUEST_MISMATCH`。所有终态响应、协调者/参与者
+   `status`、`dump` 都带 `identity`，可证明状态实际对应的是哪次约定。
